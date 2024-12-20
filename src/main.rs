@@ -1,18 +1,24 @@
 use std::{env::args, time::Instant};
 
 use anyhow::{anyhow, bail};
+use fast_image_resize::{images::{Image, ImageRef}, FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use ffmpeg_sidecar::{command::FfmpegCommand, event::{FfmpegEvent, LogLevel, OutputVideoFrame}};
-use image::{save_buffer, ExtendedColorType, RgbImage};
+use image::{save_buffer, ExtendedColorType, GrayImage, ImageError};
 use image_hasher::{HashAlg, HasherConfig};
 
-fn save_frame(path: &str, frame: &OutputVideoFrame) -> Result<(), image::ImageError> {
-    save_buffer(path, &frame.data, frame.width, frame.height, ExtendedColorType::Rgb8)
+fn save_frame(path: &str, frame: &OutputVideoFrame) -> Result<(), ImageError> {
+    save_buffer(path, &frame.data, frame.width, frame.height, ExtendedColorType::L8)
 }
 
-fn hash_frame(frame: OutputVideoFrame) -> u64 {
-    let buffer = RgbImage::from_raw(frame.width, frame.height, frame.data).unwrap();
+fn hash_frame(frame: &OutputVideoFrame) -> u64 {
+    let buffer = ImageRef::new(frame.width, frame.height, &frame.data, PixelType::U8).unwrap();
+    let mut resized_buffer = Image::new(9, 8, buffer.pixel_type());
+    Resizer::new().resize(&buffer, &mut resized_buffer, &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear))).unwrap();
+
+    // TODO: Implement this code without image_hasher library
+    let resized_buffer = GrayImage::from_raw(resized_buffer.width(), resized_buffer.height(), resized_buffer.into_vec()).unwrap();
     let hasher = HasherConfig::with_bytes_type::<[u8; 8]>().hash_alg(HashAlg::Gradient).to_hasher();
-    let hash = hasher.hash_image(&buffer);
+    let hash = hasher.hash_image(&resized_buffer);
     u64::from_le_bytes(hash.into_inner())
 }
 
@@ -32,7 +38,8 @@ fn main() -> anyhow::Result<()> {
 
     let iter = FfmpegCommand::new()
       .input(path)
-      .rawvideo()
+      //.rawvideo()
+      .args(["-f", "rawvideo", "-pix_fmt", "gray", "-"])
       .spawn()?
       .iter()?;
 
@@ -45,14 +52,15 @@ fn main() -> anyhow::Result<()> {
                 return Err(anyhow!(err).context("Failed to decode video with FFmpeg"));
             },
             FfmpegEvent::OutputFrame(frame) => {
-                println!("frame {}: {}x{}", frame.frame_num, frame.width, frame.height);
-
-                // save_frame(&format!("frame_{}.png", frame.frame_num), &frame)?;
-
                 frames += 1;
-                let hash = hash_frame(frame);
+                let hash = hash_frame(&frame);
                 if Some(&hash) != hashed.last() {
                     hashed.push(hash);
+                }
+
+                if frame.frame_num % 100 == 0 {
+                    // save_frame(&format!("frame_{}.png", frame.frame_num), &frame)?;
+                    println!("frame {}: {}x{} {:x}", frame.frame_num, frame.width, frame.height, hash);
                 }
             }
             _ => {},
