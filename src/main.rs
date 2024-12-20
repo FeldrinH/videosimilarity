@@ -10,16 +10,35 @@ fn save_frame(path: &str, frame: &OutputVideoFrame) -> Result<(), ImageError> {
     save_buffer(path, &frame.data, frame.width, frame.height, ExtendedColorType::L8)
 }
 
-fn hash_frame(frame: &OutputVideoFrame) -> u64 {
-    let buffer = ImageRef::new(frame.width, frame.height, &frame.data, PixelType::U8).unwrap();
-    let mut resized_buffer = Image::new(9, 8, buffer.pixel_type());
-    Resizer::new().resize(&buffer, &mut resized_buffer, &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear))).unwrap();
+fn resize_frame(frame: &OutputVideoFrame, width: u32, height: u32) -> Image {
+    let src_image = ImageRef::new(frame.width, frame.height, &frame.data, PixelType::U8).unwrap();
+    let mut dst_image = Image::new(width, height, src_image.pixel_type());
+    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
+    Resizer::new().resize(&src_image, &mut dst_image, &options).unwrap();
+    dst_image
+}
 
-    // TODO: Implement this code without image_hasher library
-    let resized_buffer = GrayImage::from_raw(resized_buffer.width(), resized_buffer.height(), resized_buffer.into_vec()).unwrap();
+fn hash_frame(frame: &OutputVideoFrame) -> u64 {
+    let image = resize_frame(frame, 9, 8);
+    let image = GrayImage::from_raw(image.width(), image.height(), image.into_vec()).unwrap();
     let hasher = HasherConfig::with_bytes_type::<[u8; 8]>().hash_alg(HashAlg::Gradient).to_hasher();
-    let hash = hasher.hash_image(&resized_buffer);
+    let hash = hasher.hash_image(&image);
     u64::from_le_bytes(hash.into_inner())
+}
+
+/// dHash based on https://www.hackerfactor.com/blog/index.php?/archives/529-Kind-of-Like-That.html
+/// Should match HashAlg::Gradient from image_hasher
+fn hash_frame_dhash(frame: &OutputVideoFrame) -> u64 {
+    let image = resize_frame(frame, 9, 8);
+    let pixels = image.buffer();
+    let mut hash = 0u64;
+    for y in 0..8 {
+        for x in 0..8 {
+            let bit = pixels[9 * y + x] < pixels[9 * y + x + 1];
+            hash |= (bit as u64) << (8 * y + x)
+        }
+    }
+    hash
 }
 
 fn main() -> anyhow::Result<()> {
@@ -33,6 +52,7 @@ fn main() -> anyhow::Result<()> {
     ffmpeg_sidecar::download::auto_download()?;
     let ffmpeg_version = ffmpeg_sidecar::version::ffmpeg_version()?;
     println!("Using FFmpeg {}", ffmpeg_version);
+    println!("Resizing CPU extensions: {:?}", Resizer::new().cpu_extensions());
 
     let start = Instant::now();
 
@@ -53,7 +73,7 @@ fn main() -> anyhow::Result<()> {
             },
             FfmpegEvent::OutputFrame(frame) => {
                 frames += 1;
-                let hash = hash_frame(&frame);
+                let hash = hash_frame_dhash(&frame);
                 if Some(&hash) != hashed.last() {
                     hashed.push(hash);
                 }
